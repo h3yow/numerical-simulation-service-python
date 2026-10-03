@@ -12,7 +12,7 @@ from __future__ import annotations
 import queue
 import threading
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 from app.models import (
     ErrorReason,
@@ -56,6 +56,7 @@ class TaskManager:
             raise ValueError("max_concurrent 必须 >= 1")
         self._max_queue = max_queue
         self._lock = threading.Lock()
+        self._space_cond = threading.Condition(self._lock)
         self._tasks: dict[str, _Task] = {}
         self._queue: queue.Queue[Optional[_Task]] = queue.Queue()
         self._shutdown = False
@@ -85,6 +86,45 @@ class TaskManager:
             self._tasks[task.task_id] = task
         self._queue.put(task)
         return self._view(task)
+
+    # ---- 排队容量（供批量派发复用同一套排队规则） ----
+    def free_queue_slots(self) -> int:
+        """当前还能接纳多少个排队任务。"""
+        with self._lock:
+            if self._shutdown:
+                return 0
+            queued = sum(1 for t in self._tasks.values() if t.status == TaskStatus.QUEUED)
+            return max(0, self._max_queue - queued)
+
+    def wait_for_space(
+        self,
+        should_abort: Optional[Callable[[], bool]] = None,
+        timeout: float = 1.0,
+    ) -> bool:
+        """阻塞等待直到出现排队空位、服务关闭或 should_abort 为真。
+
+        返回 True 表示当前可提交（仍有空位且未关闭/未中止），否则应停止派发。
+        批量派发线程借此与普通单任务共用同一有界队列：满了就排队等待，
+        既不绕过并发上限，也不会把任务收下后失败。
+        """
+        with self._space_cond:
+            if self._shutdown or (should_abort is not None and should_abort()):
+                return False
+            self._space_cond.wait_for(
+                lambda: self._shutdown
+                or (should_abort is not None and should_abort())
+                or self.free_queue_slots_locked() > 0,
+                timeout=timeout,
+            )
+            return (
+                not self._shutdown
+                and (should_abort is None or not should_abort())
+                and self.free_queue_slots_locked() > 0
+            )
+
+    def free_queue_slots_locked(self) -> int:
+        queued = sum(1 for t in self._tasks.values() if t.status == TaskStatus.QUEUED)
+        return max(0, self._max_queue - queued)
 
     # ---- 查询 ----
     def get(self, task_id: str) -> Optional[TaskView]:
@@ -119,6 +159,7 @@ class TaskManager:
                 task.status = TaskStatus.CANCELLED
                 task.error_reason = ErrorReason.CANCELLED
                 task.error_detail = "任务在排队时被取消"
+                self._space_cond.notify_all()  # 释放一个排队名额
             elif task.status == TaskStatus.RUNNING:
                 # 运行中：置取消事件，求解器在安全点退出并自行迁移状态
                 task.cancel_event.set()
@@ -129,6 +170,7 @@ class TaskManager:
     def shutdown(self) -> None:
         with self._lock:
             self._shutdown = True
+            self._space_cond.notify_all()
         for _ in self._workers:
             self._queue.put(None)
         for w in self._workers:
@@ -152,6 +194,7 @@ class TaskManager:
                 task.status = TaskStatus.RUNNING
                 self._running += 1
                 self._max_running_observed = max(self._max_running_observed, self._running)
+                self._space_cond.notify_all()  # 离开队列，腾出一个排队名额
             try:
                 final = run_simulation(
                     task.req,
